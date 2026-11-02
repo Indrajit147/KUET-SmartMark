@@ -64,7 +64,8 @@ def layout():
     return col
 
 
-def main() -> None:
+def build() -> "Path":
+    """Write a new workbook from the reports and return its path."""
     sheets = read_csv("m5_sheets.csv")
     cells = defaultdict(dict)
     for r in read_csv("m5_cells.csv"):
@@ -197,7 +198,11 @@ def main() -> None:
     yellow = sum(1 for row in chk.iter_rows(min_row=2) for c in row if c.fill.fgColor.rgb in ("00FFF2A8", "FFFFF2A8"))
     assert rows == len(students) and yellow == n_yellow, (rows, len(students), yellow, n_yellow)
     print(f"Students: {rows} | yellow cells to check: {n_yellow} | review rows: {len(review)}")
-    print(f"Saved: {out.relative_to(ROOT)}")
+    return out
+
+
+def main() -> None:
+    print(f"Saved: {build().relative_to(ROOT)}")
 
 
 if __name__ == "__main__":

@@ -167,6 +167,7 @@ def save_crops(sid: str, res: dict) -> None:
     boxes = {c: named[c] for c in res["flagged"]}
     boxes["roll_row"] = [named["roll_1"][0], named["roll_1"][1], named["roll_7"][2], named["roll_7"][3]]
     boxes["header_roll"] = named["header_roll"]
+    boxes["letter"] = named["letter"]
     for name, (x0, y0, x1, y1) in boxes.items():
         cv2.imwrite(str(out / f"{name}.png"), warp[y0:y1, x0:x1])
 
@@ -219,41 +220,43 @@ def evaluate(results: dict, threshold: float) -> list[str]:
     return lines
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("inputs", nargs="*", help="photos or folders (default: data\\raw)")
-    ap.add_argument("--threshold", type=float, default=0.8)  # held-out: 0 silent errors from 0.7 up; 0.8 keeps flags <= 10%
-    args = ap.parse_args()
+def collect(inputs: list) -> tuple[list[Path], dict]:
+    """Photos from files/folders (scan id = file name), or data\\raw when none are given."""
+    if not inputs:
+        files = list_raw_images()
+        return files, assign_scan_ids(files)
+    files = []
+    for i in map(Path, inputs):
+        files += sorted(p for p in i.rglob("*") if p.suffix.lower() in SUPPORTED and not p.name.startswith("~$")) \
+            if i.is_dir() else [i]
+    return files, {p: p.stem for p in files}
+
+
+def run(files: list[Path], ids: dict, threshold: float = 0.8, progress=None) -> list[str]:
+    """Read every photo, write the reports/crops/previews, return the summary lines.
+    progress(i, n, line) is called after each photo (the app uses it for its progress bar)."""
     if not MODEL.exists():
         raise SystemExit("models\\digit_cnn.onnx missing - run scripts\\08_train_digits.py first")
     net = cv2.dnn.readNetFromONNX(str(MODEL))
     t = load_template()
-    if args.inputs:
-        files = []
-        for i in map(Path, args.inputs):
-            files += sorted(p for p in i.rglob("*") if p.suffix.lower() in SUPPORTED) if i.is_dir() else [i]
-        ids = {p: p.stem for p in files}
-    else:
-        files = list_raw_images()
-        ids = assign_scan_ids(files)
     (PREVIEW_DIR / "m5").mkdir(parents=True, exist_ok=True)
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
 
     results = {}
-    for path in files:
+    for n, path in enumerate(files, start=1):
         t0 = time.time()
         img = cv2.imread(str(path))
         sid = ids[path]
-        res = read_sheet(net, t, img, args.threshold) if img is not None else \
+        res = read_sheet(net, t, img, threshold) if img is not None else \
             {"status": "fail", "reasons": ["cannot open image"], "section": "", "roll": "", "cells": {}}
         res["file"] = str(path)
         results[sid] = res
         if res["status"] != "fail":
             preview(sid, res, PREVIEW_DIR / "m5" / f"{sid}.jpg")
             save_crops(sid, res)
-        print(f"{sid}: {res['status']:6s} section {res['section'] or '?'} roll {res['roll'] or '?':7s} "
-              f"flagged cells {len(res.get('flagged', []))}  {'; '.join(res['reasons'])}  ({time.time() - t0:.1f}s)",
-              flush=True)
+        line = (f"{sid}: {res['status']:6s} section {res['section'] or '?'} roll {res['roll'] or '?':7s} "
+                f"flagged cells {len(res.get('flagged', []))}  {'; '.join(res['reasons'])}  ({time.time() - t0:.1f}s)")
+        (progress or (lambda i, k, txt: print(txt, flush=True)))(n, len(files), line)
 
     dup = Counter((r["roll"], r["section"]) for r in results.values() if r["roll"] and r["section"])
     for sid, r in results.items():
@@ -276,9 +279,19 @@ def main() -> None:
 
     st = Counter(r["status"] for r in results.values())
     summary = [f"Sheets: {len(results)} | ok {st['ok']} | review {st['review']} | fail {st['fail']} "
-               f"(threshold {args.threshold})"]
-    summary += evaluate(results, args.threshold)
+               f"(threshold {threshold})"]
+    summary += evaluate(results, threshold)
     (REPORT_DIR / "m5_evaluation.txt").write_text("\n".join(summary) + "\n", encoding="utf-8")
+    return summary
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("inputs", nargs="*", help="photos or folders (default: data\\raw)")
+    ap.add_argument("--threshold", type=float, default=0.8)  # held-out: 0 silent errors from 0.7 up; 0.8 keeps flags <= 10%
+    args = ap.parse_args()
+    files, ids = collect(args.inputs)
+    summary = run(files, ids, args.threshold)
     print("\n" + "\n".join(summary))
     print("Results: reports\\m5_sheets.csv, reports\\m5_cells.csv | previews: data\\preview\\m5\\")
 

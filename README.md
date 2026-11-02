@@ -191,6 +191,23 @@ Creates a **new** `output\SmartMark_marks_<date>_<time>.xlsx` every run (an edit
 - **Review**: every yellow cell with the photo of what was written, so checking is quick.
 - **Covers**: every photo with its status.
 
+## 13 — Teacher app (Milestone 7)
+
+```bat
+.venv\Scripts\python.exe scripts\smartmark_app.py
+```
+
+1. **Photos folder** -> Browse... to the folder of cover photos, then **Scan** (progress bar, ~1 s per photo).
+2. Every doubtful item is shown one at a time: the photo of what was written, what was read, and why it
+   was flagged (a mark, an unsure roll number, an unclear section letter, or a page to glance at).
+   Type the right value and press **Enter** (an empty box = blank cell); Up/Down = previous/next.
+   Answers are saved as you go, so the app can be closed and reopened (**Review last scan**).
+3. **Export Excel** applies the answers and writes a new workbook in `output\` (**Open workbook** opens it).
+   Items not checked stay yellow in the workbook.
+
+Every correction is logged in `reports\teacher_corrections.csv` (with the crop) to retrain the model later.
+Needs Tkinter, which the standard python.org installer includes ("tcl/tk and IDLE" option).
+
 ## Exit criteria for Milestone 1
 
 - Inventory covers every image, and all suspected corrupt/duplicate/sideways files are investigated.
@@ -201,4 +218,4 @@ Creates a **new** `output\SmartMark_marks_<date>_<time>.xlsx` every run (an edit
 
 ## Next milestone
 
-M7 — teacher app: pick a folder of photos, press Scan, review the flagged cells on screen, export the workbook.
+M7 part 2 — package the app as a Windows program (SmartMark.exe) that runs without Python, plus a one-page teacher guide.

@@ -6,3 +6,7 @@ __pycache__/
 ~$*
 # temporary upload bundles
 _upload/
+# exe build output
+build/
+dist/
+*.spec

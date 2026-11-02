@@ -1,13 +1,14 @@
-"""KUET SmartMark - teacher app (Milestone 7).
+r"""SmartMark - teacher app (Milestone 7).
 
-    .venv\\Scripts\\python.exe scripts\\smartmark_app.py
+    .venv\Scripts\python.exe scripts\smartmark_app.py      (or SmartMark.exe after build_exe.bat)
 
-1. Choose the folder of cover photos and press Scan (about 1 s per photo).
-2. Check every doubtful item: the photo of what was written is shown next to what was read.
-   Enter = save and go to the next item, Up/Down = previous/next, an empty box = blank cell.
-3. Export Excel: corrections are applied and a new workbook is written to output\\.
-Answers are saved as you go (reports\\review_answers.json), so closing the app loses nothing.
-Every correction is also logged in reports\\teacher_corrections.csv for retraining the model later.
+1  Scan photos     choose the folder of cover photos, press Scan (about 1 s per photo); live progress and counts.
+2  Check flagged   each doubtful item: the photo of what was written, what was read, how sure, and why.
+                   Type the right value + Enter, or Keep / Blank. Up/Down = previous/next; click any item to jump.
+3  All covers      every cover with its status; View shows the whole page with what was read.
+4  Export Excel    applies the answers and writes a new workbook in output\ (Open workbook / Open folder).
+Answers are saved as you go (reports\review_answers.json), so closing the app loses nothing.
+Every correction is logged in reports\teacher_corrections.csv for retraining the model later.
 """
 from __future__ import annotations
 
@@ -18,12 +19,13 @@ import queue
 import re
 import threading
 import time
-import tkinter as tk
 from importlib import import_module
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox
 
-from PIL import Image, ImageTk
+import customtkinter as ctk
+
+from PIL import Image
 
 from common import PREVIEW_DIR, REPORT_DIR, ROOT
 
@@ -143,74 +145,144 @@ def apply_answers(items: list[dict]) -> int:
 
 
 # ------------------------------------------------------------------ window
-class App:
-    def __init__(self, root: tk.Tk):
-        self.root, self.items, self.i, self.photos = root, [], 0, []
+OK, REVIEW, FAIL = "#2e9d5b", "#d98e04", "#d64545"
+CHIP = {"ok": OK, "review": REVIEW, "fail": FAIL}
+
+
+def conf_colour(conf: str) -> str:
+    try:
+        c = float(conf)
+    except ValueError:
+        return REVIEW
+    return OK if c >= 0.8 else (REVIEW if c >= 0.5 else FAIL)
+
+
+def ctk_image(path: str, box: tuple[int, int], upscale: float = 4.0):
+    """A CTkImage scaled to fit `box` (small crops are enlarged up to `upscale` x)."""
+    im = Image.open(path)
+    k = min(box[0] / im.width, box[1] / im.height, upscale)
+    return ctk.CTkImage(light_image=im, dark_image=im, size=(max(1, int(im.width * k)), max(1, int(im.height * k))))
+
+
+class PageViewer(ctk.CTkToplevel):
+    """Pop-up showing a whole cover with what was read (orange boxes = flagged)."""
+    def __init__(self, master, sid: str):
+        super().__init__(master)
+        self.title(f"Cover {sid} - what SmartMark read")
+        self.geometry("760x900")
+        path = PREVIEW_DIR / "m5" / f"{sid}.jpg"
+        if path.exists():
+            ctk.CTkLabel(self, text="", image=ctk_image(str(path), (720, 840), 1.0)).pack(padx=16, pady=16)
+        else:
+            ctk.CTkLabel(self, text="No preview for this cover (the photo was not recognised).").pack(padx=30, pady=30)
+        self.after(100, self.lift)
+
+
+class SmartMarkApp(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.title("SmartMark - KUET answer-script reader")
+        self.geometry("1280x800")
+        self.minsize(1100, 700)
         self.q: queue.Queue = queue.Queue()
-        root.title("KUET SmartMark")
-        root.geometry("1100x720")
-        big = ("Segoe UI", 20, "bold")
+        self.items: list[dict] = []
+        self.i = 0
+        self.book: Path | None = None
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+        self.f_big = ctk.CTkFont(size=28, weight="bold")
+        self.f_title = ctk.CTkFont(size=22, weight="bold")
+        self.f_head = ctk.CTkFont(size=15, weight="bold")
 
-        top = ttk.Frame(root, padding=10)
-        top.pack(fill="x")
-        ttk.Label(top, text="Photos folder:").pack(side="left")
-        self.folder = tk.StringVar(value=str(ROOT / "data" / "raw"))
-        ttk.Entry(top, textvariable=self.folder, width=70).pack(side="left", padx=6)
-        ttk.Button(top, text="Browse...", command=self.browse).pack(side="left")
-        self.scan_btn = ttk.Button(top, text="Scan", command=self.scan)
-        self.scan_btn.pack(side="left", padx=10)
+        side = ctk.CTkFrame(self, width=230, corner_radius=0)
+        side.grid(row=0, column=0, sticky="nsw")
+        side.grid_rowconfigure(6, weight=1)
+        ctk.CTkLabel(side, text="SmartMark", font=ctk.CTkFont(size=26, weight="bold")).grid(row=0, column=0, padx=24, pady=(28, 0), sticky="w")
+        ctk.CTkLabel(side, text="Marks from cover photos\nstraight into Excel", justify="left",
+                     text_color=("gray35", "gray70")).grid(row=1, column=0, padx=24, pady=(2, 24), sticky="w")
+        self.nav = {}
+        for r, (key, label) in enumerate([("scan", "1   Scan photos"), ("review", "2   Check flagged"),
+                                          ("covers", "3   All covers"), ("export", "4   Export Excel")], start=2):
+            b = ctk.CTkButton(side, text=label, anchor="w", height=40, corner_radius=8, fg_color="transparent",
+                              text_color=("gray10", "gray90"), hover_color=("gray80", "gray28"),
+                              font=ctk.CTkFont(size=14), command=lambda k=key: self.show(k))
+            b.grid(row=r, column=0, padx=14, pady=3, sticky="ew")
+            self.nav[key] = b
+        ctk.CTkLabel(side, text="Appearance").grid(row=7, column=0, padx=24, sticky="w")
+        ctk.CTkOptionMenu(side, values=["System", "Light", "Dark"], width=180,
+                          command=lambda m: ctk.set_appearance_mode(m)).grid(row=8, column=0, padx=24, pady=(4, 24))
 
-        bar = ttk.Frame(root, padding=(10, 0))
-        bar.pack(fill="x")
-        self.progress = ttk.Progressbar(bar, mode="determinate")
-        self.progress.pack(fill="x")
-        self.status = tk.StringVar(value="Choose the folder of cover photos and press Scan "
-                                         "(or press Review to continue the last scan).")
-        ttk.Label(bar, textvariable=self.status, wraplength=1050).pack(anchor="w", pady=4)
+        self.pages = {k: ctk.CTkFrame(self, fg_color="transparent") for k in self.nav}
+        for p in self.pages.values():
+            p.grid(row=0, column=1, sticky="nsew", padx=28, pady=24)
+        self._build_scan()
+        self._build_review()
+        self._build_covers()
+        self._build_export()
+        self.bind("<Return>", lambda e: self.save() if self.current == "review" else None)
+        self.bind("<Up>", lambda e: self.move(-1) if self.current == "review" else None)
+        self.bind("<Down>", lambda e: self.move(1) if self.current == "review" else None)
+        self.current = ""
+        self.show("scan")
+        self.after(200, self.load_last)
 
-        body = ttk.Frame(root, padding=10)
-        body.pack(fill="both", expand=True)
-        self.pics = ttk.Frame(body, width=600)
-        self.pics.pack(side="left", fill="both", expand=True)
-        side = ttk.Frame(body, padding=(16, 0))
-        side.pack(side="left", fill="y")
-        self.counter = tk.StringVar()
-        ttk.Label(side, textvariable=self.counter, font=("Segoe UI", 11)).pack(anchor="w")
-        self.where = tk.StringVar()
-        ttk.Label(side, textvariable=self.where, font=("Segoe UI", 14, "bold")).pack(anchor="w", pady=(8, 0))
-        self.readas = tk.StringVar()
-        ttk.Label(side, textvariable=self.readas, font=("Segoe UI", 12)).pack(anchor="w", pady=4)
-        self.why = tk.StringVar()
-        ttk.Label(side, textvariable=self.why, wraplength=380, foreground="#9a4d00").pack(anchor="w", pady=4)
-        self.ask = tk.StringVar(value="Correct value:")
-        ttk.Label(side, textvariable=self.ask).pack(anchor="w", pady=(12, 0))
-        self.entry = ttk.Entry(side, font=big, width=10)
-        self.entry.pack(anchor="w", pady=4)
-        self.entry.bind("<Return>", lambda e: self.save())
-        self.entry.bind("<Up>", lambda e: self.move(-1))
-        self.entry.bind("<Down>", lambda e: self.move(1))
-        self.error = tk.StringVar()
-        ttk.Label(side, textvariable=self.error, foreground="#b00020", wraplength=380).pack(anchor="w")
-        row = ttk.Frame(side)
-        row.pack(anchor="w", pady=8)
-        ttk.Button(row, text="< Previous", command=lambda: self.move(-1)).pack(side="left")
-        ttk.Button(row, text="Save and next  (Enter)", command=self.save).pack(side="left", padx=6)
-        ttk.Button(row, text="Next >", command=lambda: self.move(1)).pack(side="left")
-        ttk.Label(side, text="Enter = save and next   Up/Down = previous/next\n"
-                             "A blank cell: clear the box and press Enter.", foreground="#555").pack(anchor="w")
+    # ---------------------------------------------------------------- navigation
+    def show(self, key: str):
+        self.pages[key].tkraise()
+        self.current = key
+        for k, b in self.nav.items():
+            b.configure(fg_color=(("gray78", "gray25") if k == key else "transparent"))
+        if key == "review":
+            self.render_item()
+        elif key == "covers":
+            self.render_covers()
+        elif key == "export":
+            self.render_export()
 
-        foot = ttk.Frame(root, padding=10)
-        foot.pack(fill="x", side="bottom")
-        ttk.Button(foot, text="Review last scan", command=self.start_review).pack(side="left")
-        self.export_btn = ttk.Button(foot, text="Export Excel", command=self.export)
-        self.export_btn.pack(side="left", padx=10)
-        self.saved = tk.StringVar()
-        ttk.Label(foot, textvariable=self.saved).pack(side="left")
-        self.open_btn = ttk.Button(foot, text="Open workbook", command=self.open_book, state="disabled")
-        self.open_btn.pack(side="right")
-        self.book = None
+    def stat_card(self, parent, col, title, colour):
+        card = ctk.CTkFrame(parent, corner_radius=14)
+        card.grid(row=0, column=col, padx=(0 if col == 0 else 12, 0), sticky="ew")
+        parent.grid_columnconfigure(col, weight=1)
+        num = ctk.CTkLabel(card, text="-", font=ctk.CTkFont(size=34, weight="bold"), text_color=colour)
+        num.pack(anchor="w", padx=18, pady=(14, 0))
+        ctk.CTkLabel(card, text=title, text_color=("gray35", "gray70")).pack(anchor="w", padx=18, pady=(0, 14))
+        return num
 
-    # -- scanning
+    # ---------------------------------------------------------------- 1. scan
+    def _build_scan(self):
+        p = self.pages["scan"]
+        ctk.CTkLabel(p, text="Scan cover photos", font=self.f_title).pack(anchor="w")
+        ctk.CTkLabel(p, text="Choose the folder with the photos of the answer-script covers, then press Scan.",
+                     text_color=("gray35", "gray70")).pack(anchor="w", pady=(2, 16))
+        card = ctk.CTkFrame(p, corner_radius=14)
+        card.pack(fill="x")
+        card.grid_columnconfigure(0, weight=1)
+        raw = ROOT / "data" / "raw"
+        self.folder = ctk.StringVar(value=str(raw if raw.exists() else Path.home() / "Pictures"))
+        ctk.CTkEntry(card, textvariable=self.folder, height=38).grid(row=0, column=0, padx=(18, 8), pady=18, sticky="ew")
+        ctk.CTkButton(card, text="Browse...", width=110, height=38, fg_color=("gray70", "gray30"),
+                      hover_color=("gray60", "gray35"), text_color=("gray10", "gray90"),
+                      command=self.browse).grid(row=0, column=1, padx=4)
+        self.scan_btn = ctk.CTkButton(card, text="Scan", width=150, height=38, font=self.f_head, command=self.scan)
+        self.scan_btn.grid(row=0, column=2, padx=(4, 18))
+        self.bar = ctk.CTkProgressBar(p, height=12)
+        self.bar.set(0)
+        self.bar.pack(fill="x", pady=(18, 4))
+        self.scan_msg = ctk.StringVar(value="Ready.")
+        ctk.CTkLabel(p, textvariable=self.scan_msg, text_color=("gray35", "gray70")).pack(anchor="w")
+        cards = ctk.CTkFrame(p, fg_color="transparent")
+        cards.pack(fill="x", pady=16)
+        self.n_total = self.stat_card(cards, 0, "covers scanned", ("gray10", "gray90"))
+        self.n_ok = self.stat_card(cards, 1, "read cleanly", OK)
+        self.n_check = self.stat_card(cards, 2, "items to check", REVIEW)
+        self.n_fail = self.stat_card(cards, 3, "photos to retake", FAIL)
+        self.log = ctk.CTkTextbox(p, corner_radius=14, font=ctk.CTkFont(family="Consolas", size=12))
+        self.log.pack(fill="both", expand=True)
+        for tag, colour in CHIP.items():
+            self.log.tag_config(tag, foreground=colour)
+        self.next_btn = ctk.CTkButton(p, text="Check flagged items  >", height=40, font=self.f_head,
+                                      command=lambda: self.show("review"))
+
     def browse(self):
         d = filedialog.askdirectory(initialdir=self.folder.get())
         if d:
@@ -219,18 +291,20 @@ class App:
     def scan(self):
         files, ids = reader.collect([self.folder.get()])
         if not files:
-            messagebox.showwarning("SmartMark", "No photos (JPG/PNG/...) in that folder.")
+            messagebox.showwarning("SmartMark", "No photos (JPG / PNG / ...) in that folder.")
             return
         ANSWERS.unlink(missing_ok=True)  # a new batch starts with no answers
-        self.scan_btn.state(["disabled"])
-        self.progress.configure(maximum=len(files), value=0)
+        self.scan_btn.configure(state="disabled", text="Scanning...")
+        self.log.delete("1.0", "end")
+        self.next_btn.pack_forget()
+        self.bar.set(0)
         threading.Thread(target=self._scan_worker, args=(files, ids), daemon=True).start()
-        self.root.after(200, self._poll)
+        self.after(150, self._poll)
 
     def _scan_worker(self, files, ids):
         try:
-            summary = reader.run(files, ids, progress=lambda i, n, line: self.q.put(("step", i, n, line)))
-            self.q.put(("done", summary[0]))
+            reader.run(files, ids, progress=lambda i, n, line: self.q.put(("step", i, n, line)))
+            self.q.put(("done",))
         except BaseException as exc:  # shown to the teacher instead of a silent crash
             self.q.put(("error", f"{type(exc).__name__}: {exc}"))
 
@@ -238,99 +312,285 @@ class App:
         while not self.q.empty():
             msg = self.q.get()
             if msg[0] == "step":
-                self.progress.configure(value=msg[1])
-                self.status.set(f"Reading photo {msg[1]} of {msg[2]}:  {msg[3].split('(')[0]}")
-            else:
-                self.scan_btn.state(["!disabled"])
-                if msg[0] == "error":
-                    messagebox.showerror("SmartMark", f"Scan stopped: {msg[1]}")
-                    return
-                self.status.set(msg[1])
-                self.start_review()
+                _, i, n, line = msg
+                self.bar.set(i / n)
+                self.scan_msg.set(f"Reading photo {i} of {n} ...")
+                status = line.split()[1] if len(line.split()) > 1 else ""
+                self.log.insert("end", line.split("(")[0].rstrip() + "\n", status if status in CHIP else "")
+                self.log.see("end")
+                continue
+            self.scan_btn.configure(state="normal", text="Scan")
+            if msg[0] == "error":
+                self.scan_msg.set("Scan stopped.")
+                messagebox.showerror("SmartMark", f"Scan stopped:\n{msg[1]}")
                 return
-        self.root.after(200, self._poll)
+            self.load_last(after_scan=True)
+            return
+        self.after(150, self._poll)
 
-    # -- reviewing
-    def start_review(self):
+    def load_last(self, after_scan: bool = False):
+        """Fill the dashboard and review list from the last scan's reports."""
         try:
+            sheets = _read("m5_sheets.csv")
             self.items = load_items()
         except FileNotFoundError:
-            messagebox.showinfo("SmartMark", "Nothing scanned yet - press Scan first.")
             return
-        fails = [s["scan_id"] for s in _read("m5_sheets.csv") if s["status"] == "fail"]
-        msg = f"{len(self.items)} item(s) to check."
-        if fails:
-            msg += f"  Photos not recognised (retake them): {', '.join(fails)}."
-        self.status.set(self.status.get().split("  |")[0] + "  |  " + msg)
+        self.n_total.configure(text=str(len(sheets)))
+        self.n_ok.configure(text=str(sum(s["status"] == "ok" for s in sheets)))
+        self.n_check.configure(text=str(sum(i["answer"] is None for i in self.items)))
+        self.n_fail.configure(text=str(sum(s["status"] == "fail" for s in sheets)))
+        self.bar.set(1)
+        left = sum(i["answer"] is None for i in self.items)
+        self.scan_msg.set(("Scan finished. " if after_scan else "Last scan loaded. ")
+                          + (f"{left} item(s) need a look." if left else "Nothing to check - go to Export."))
+        if not self.log.get("1.0", "end").strip():
+            for s in sheets:
+                line = f"{s['scan_id']}: {s['status']:6s} section {s['section'] or '?'} roll {s['roll_no'] or '?':7s} {s['reasons']}"
+                self.log.insert("end", line + "\n", s["status"])
+        self.next_btn.pack(anchor="e", pady=(12, 0))
         self.i = next((k for k, it in enumerate(self.items) if it["answer"] is None), 0)
-        self.show()
+        self.refresh_list()
 
-    def show(self):
-        for w in self.pics.winfo_children():
+    # ---------------------------------------------------------------- 2. review
+    def _build_review(self):
+        p = self.pages["review"]
+        p.grid_columnconfigure(0, weight=3)
+        p.grid_columnconfigure(1, weight=2)
+        p.grid_rowconfigure(2, weight=1)
+        head = ctk.CTkFrame(p, fg_color="transparent")
+        head.grid(row=0, column=0, columnspan=2, sticky="ew")
+        ctk.CTkLabel(head, text="Check flagged items", font=self.f_title).pack(side="left")
+        self.done_lbl = ctk.CTkLabel(head, text="", text_color=("gray35", "gray70"))
+        self.done_lbl.pack(side="right")
+        self.done_bar = ctk.CTkProgressBar(p, height=10, progress_color=OK)
+        self.done_bar.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 16))
+        self.done_bar.set(0)
+
+        left = ctk.CTkFrame(p, corner_radius=14)
+        left.grid(row=2, column=0, sticky="nsew", padx=(0, 16))
+        self.crop_box = ctk.CTkFrame(left, fg_color="transparent")
+        self.crop_box.pack(fill="both", expand=True, padx=18, pady=18)
+        self.page_btn = ctk.CTkButton(left, text="Show the whole cover", fg_color="transparent", border_width=1,
+                                      text_color=("gray10", "gray90"), command=self.open_page)
+        self.page_btn.pack(anchor="w", padx=18, pady=(0, 18))
+
+        right = ctk.CTkFrame(p, fg_color="transparent")
+        right.grid(row=2, column=1, sticky="nsew")
+        right.grid_rowconfigure(1, weight=1)
+        right.grid_columnconfigure(0, weight=1)
+        info = ctk.CTkFrame(right, corner_radius=14)
+        info.grid(row=0, column=0, sticky="ew")
+        self.where = ctk.CTkLabel(info, text="", font=self.f_head, anchor="w")
+        self.where.pack(fill="x", padx=18, pady=(16, 2))
+        row = ctk.CTkFrame(info, fg_color="transparent")
+        row.pack(fill="x", padx=18)
+        ctk.CTkLabel(row, text="Read as", text_color=("gray35", "gray70")).pack(side="left")
+        self.read_lbl = ctk.CTkLabel(row, text="", font=self.f_big)
+        self.read_lbl.pack(side="left", padx=12)
+        self.conf_chip = ctk.CTkLabel(row, text="", corner_radius=10, text_color="white", width=110)
+        self.conf_chip.pack(side="left")
+        self.why = ctk.CTkLabel(info, text="", wraplength=430, justify="left", anchor="w", text_color=REVIEW)
+        self.why.pack(fill="x", padx=18, pady=(4, 8))
+        self.ask = ctk.CTkLabel(info, text="", anchor="w")
+        self.ask.pack(fill="x", padx=18)
+        self.entry = ctk.CTkEntry(info, height=52, font=self.f_big, justify="center")
+        self.entry.pack(fill="x", padx=18, pady=6)
+        self.err = ctk.CTkLabel(info, text="", text_color=FAIL, wraplength=430, anchor="w", justify="left")
+        self.err.pack(fill="x", padx=18)
+        btns = ctk.CTkFrame(info, fg_color="transparent")
+        btns.pack(fill="x", padx=18, pady=(6, 4))
+        btns.grid_columnconfigure((0, 1, 2), weight=1, uniform="btn")  # equal widths whatever the labels
+        self.keep_btn = ctk.CTkButton(btns, text="Keep", fg_color=OK, hover_color="#26834c", command=self.keep)
+        self.keep_btn.grid(row=0, column=0, sticky="ew")
+        self.blank_btn = ctk.CTkButton(btns, text="Blank", fg_color=("gray60", "gray35"), command=self.blank)
+        self.blank_btn.grid(row=0, column=1, sticky="ew", padx=6)
+        ctk.CTkButton(btns, text="Save  (Enter)", command=self.save).grid(row=0, column=2, sticky="ew")
+        nav = ctk.CTkFrame(info, fg_color="transparent")
+        nav.pack(fill="x", padx=18, pady=(4, 16))
+        ctk.CTkButton(nav, text="<  Previous", width=120, fg_color="transparent", border_width=1,
+                      text_color=("gray10", "gray90"), command=lambda: self.move(-1)).pack(side="left")
+        ctk.CTkButton(nav, text="Next  >", width=120, fg_color="transparent", border_width=1,
+                      text_color=("gray10", "gray90"), command=lambda: self.move(1)).pack(side="right")
+        ctk.CTkLabel(right, text="All items  (click to jump)", anchor="w", font=self.f_head).grid(row=1, column=0, sticky="nw", pady=(14, 0))
+        self.list = ctk.CTkScrollableFrame(right, corner_radius=14)
+        self.list.grid(row=1, column=0, sticky="nsew", pady=(44, 0))
+        self.list_btns: list = []
+
+    def refresh_list(self):
+        for b in self.list_btns:
+            b.destroy()
+        self.list_btns = []
+        for k, it in enumerate(self.items):
+            done = it["answer"] is not None
+            label = {"cell": it["cell"].upper().replace("_", ""), "roll": "Roll no.", "section": "Section",
+                     "sheet": "Page"}[it["kind"]]
+            shown = it["answer"] if done else "?"
+            b = ctk.CTkButton(self.list, anchor="w", height=30, corner_radius=6,
+                              text=f"{'✓' if done else '•'}  {it['scan_id']}   {label:9s}  {it['read'] or '-'} -> {shown or 'blank'}",
+                              fg_color=(("gray75", "gray30") if k == self.i else "transparent"),
+                              text_color=(OK if done else ("gray10", "gray90")), hover_color=("gray80", "gray28"),
+                              command=lambda k=k: self.jump(k))
+            b.pack(fill="x", pady=1)
+            self.list_btns.append(b)
+        done = sum(i["answer"] is not None for i in self.items)
+        self.done_bar.set(done / len(self.items) if self.items else 1)
+        self.done_lbl.configure(text=f"{done} of {len(self.items)} checked" if self.items else "")
+        self.n_check.configure(text=str(len(self.items) - done))
+
+    def render_item(self):
+        for w in self.crop_box.winfo_children():
             w.destroy()
-        self.photos = []  # Tk shows an image only while a Python reference to it exists
-        self.error.set("")
+        self.err.configure(text="")
         if not self.items:
-            self.counter.set("Nothing to check - every value was read confidently.")
-            self.where.set(""), self.readas.set(""), self.why.set("")
+            ctk.CTkLabel(self.crop_box, text="Nothing to check.\nEvery value was read confidently - go to Export.",
+                         font=self.f_head).pack(expand=True)
+            for w in (self.where, self.read_lbl, self.why, self.ask):
+                w.configure(text="")
+            self.conf_chip.configure(text="", fg_color="transparent")
+            self.entry.delete(0, "end")
+            self.keep_btn.configure(text="Keep")
             return
         it = self.items[self.i]
-        left = sum(x["answer"] is None for x in self.items)
-        self.counter.set(f"Item {self.i + 1} of {len(self.items)}   ({left} still to check)"
-                         + ("   - checked" if it["answer"] is not None else ""))
-        label = {"cell": it["cell"].upper().replace("_", ""), "roll": "Roll number", "section": "Section letter",
-                 "sheet": "Whole page"}[it["kind"]]
-        self.where.set(f"Cover {it['scan_id']}  -  {label}")
-        self.readas.set(f"Read as:  {it['read'] or '(blank)'}" + (f"   (confidence {it['conf']})" if it["conf"] else "")
-                        if it["kind"] != "sheet" else "Check the page preview: are the values right?")
-        self.why.set(f"Why: {it['why']}")
-        self.ask.set({"cell": "Correct mark (empty = blank):", "roll": "Correct roll number (7 digits):",
-                      "section": "Section (A or B):", "sheet": "Press Enter if the page was read correctly:"}[it["kind"]])
+        label = {"cell": f"Mark {it['cell'].upper().replace('_', '')}", "roll": "Roll number",
+                 "section": "Section letter", "sheet": "Whole page"}[it["kind"]]
+        self.where.configure(text=f"Cover {it['scan_id']}  ·  {label}      ({self.i + 1} / {len(self.items)})")
+        self.read_lbl.configure(text=it["read"] or ("(blank)" if it["kind"] != "sheet" else ""))
+        if it["conf"]:
+            self.conf_chip.configure(text=f"sure {float(it['conf']):.0%}", fg_color=conf_colour(it["conf"]))
+        else:
+            self.conf_chip.configure(text="", fg_color="transparent")
+        self.why.configure(text=f"Why: {it['why']}")
+        self.ask.configure(text={"cell": "Correct mark (empty = blank cell)", "roll": "Correct roll number (7 digits)",
+                                 "section": "Section (A or B)", "sheet": "Page read correctly? Press Enter / Keep"}[it["kind"]])
+        self.keep_btn.configure(text=f"Keep  {it['read']}" if it["read"] else "Keep")
+        self.blank_btn.configure(state="normal" if it["kind"] == "cell" else "disabled")
         for p in it["images"]:
             if Path(p).exists():
-                im = Image.open(p)
-                box = (580, 560) if it["kind"] == "sheet" else (560, 260)
-                k = min(box[0] / im.width, box[1] / im.height, 4.0)
-                im = im.resize((max(1, int(im.width * k)), max(1, int(im.height * k))))
-                ph = ImageTk.PhotoImage(im)
-                self.photos.append(ph)
-                ttk.Label(self.pics, image=ph).pack(anchor="w", pady=4)
+                box = (620, 520) if it["kind"] == "sheet" else (620, 240)
+                ctk.CTkLabel(self.crop_box, text="", image=ctk_image(p, box)).pack(anchor="center", pady=6)
         self.entry.delete(0, "end")
         self.entry.insert(0, it["answer"] if it["answer"] is not None else it["read"])
         self.entry.select_range(0, "end")
         self.entry.focus_set()
 
-    def save(self):
+    def _store(self, text: str):
         if not self.items:
             return
         it = self.items[self.i]
-        value, err = validate(it["kind"], self.entry.get())
+        value, err = validate(it["kind"], text)
         if value is None:
-            self.error.set(err)
+            self.err.configure(text=err)
+            self.entry.focus_set()
             return
         it["answer"] = value
         save_answers(self.items)
         nxt = next((k for k in list(range(self.i + 1, len(self.items))) + list(range(self.i))
                     if self.items[k]["answer"] is None), None)
+        if nxt is not None:
+            self.i = nxt
+        self.refresh_list()
+        self.render_item()
         if nxt is None:
-            self.status.set("All items checked - press Export Excel.")
-            self.show()
-            return
-        self.i = nxt
-        self.show()
+            self.where.configure(text="All items checked  ✓   Go to Export Excel.")
+
+    def save(self):
+        self._store(self.entry.get())
+
+    def keep(self):
+        self._store(self.items[self.i]["read"] if self.items else "")
+
+    def blank(self):
+        self._store("")
 
     def move(self, step):
         if self.items:
             self.i = (self.i + step) % len(self.items)
-            self.show()
+            self.refresh_list()
+            self.render_item()
         return "break"
 
-    # -- export
+    def jump(self, k):
+        self.i = k
+        self.refresh_list()
+        self.render_item()
+
+    def open_page(self):
+        if self.items:
+            PageViewer(self, self.items[self.i]["scan_id"])
+
+    # ---------------------------------------------------------------- 3. covers
+    def _build_covers(self):
+        p = self.pages["covers"]
+        head = ctk.CTkFrame(p, fg_color="transparent")
+        head.pack(fill="x")
+        ctk.CTkLabel(head, text="All covers", font=self.f_title).pack(side="left")
+        self.filter = ctk.CTkSegmentedButton(head, values=["All", "To check", "OK", "Retake"],
+                                             command=lambda v: self.render_covers())
+        self.filter.set("All")
+        self.filter.pack(side="right")
+        ctk.CTkLabel(p, text="Click a cover to see the whole page with what was read (orange = flagged).",
+                     text_color=("gray35", "gray70")).pack(anchor="w", pady=(2, 12))
+        self.cover_list = ctk.CTkScrollableFrame(p, corner_radius=14)
+        self.cover_list.pack(fill="both", expand=True)
+
+    def render_covers(self):
+        for w in self.cover_list.winfo_children():
+            w.destroy()
+        try:
+            sheets = _read("m5_sheets.csv")
+        except FileNotFoundError:
+            ctk.CTkLabel(self.cover_list, text="Nothing scanned yet.").pack(pady=20)
+            return
+        want = {"All": None, "To check": "review", "OK": "ok", "Retake": "fail"}[self.filter.get()]
+        for s in sheets:
+            if want and s["status"] != want:
+                continue
+            row = ctk.CTkFrame(self.cover_list, corner_radius=10)
+            row.pack(fill="x", pady=3, padx=4)
+            ctk.CTkLabel(row, text={"ok": "OK", "review": "CHECK", "fail": "RETAKE"}[s["status"]], width=74,
+                         corner_radius=8, fg_color=CHIP[s["status"]], text_color="white").pack(side="left", padx=10, pady=8)
+            ctk.CTkLabel(row, text=s["scan_id"], font=self.f_head, width=70, anchor="w").pack(side="left")
+            ctk.CTkLabel(row, text=f"Section {s['section'] or '?'}    Roll {s['roll_no'] or '?'}", width=230,
+                         anchor="w").pack(side="left")
+            flagged = len(s["flagged_cells"].split())
+            note = "; ".join(filter(None, [f"{flagged} mark(s) to check" if flagged else "", s["reasons"]]))
+            ctk.CTkLabel(row, text=note, anchor="w", text_color=("gray35", "gray70")).pack(side="left", fill="x", expand=True)
+            ctk.CTkButton(row, text="View", width=70, command=lambda sid=s["scan_id"]: PageViewer(self, sid)).pack(side="right", padx=10)
+
+    # ---------------------------------------------------------------- 4. export
+    def _build_export(self):
+        p = self.pages["export"]
+        ctk.CTkLabel(p, text="Export to Excel", font=self.f_title).pack(anchor="w")
+        ctk.CTkLabel(p, text="One row per student (Section A and B covers merged by roll number), each section = best 3 "
+                             "of its 4 questions, Final = A + B. Totals are live formulas.",
+                     text_color=("gray35", "gray70"), wraplength=900, justify="left").pack(anchor="w", pady=(2, 16))
+        card = ctk.CTkFrame(p, corner_radius=14)
+        card.pack(fill="x")
+        self.export_info = ctk.CTkLabel(card, text="", font=self.f_head, anchor="w", justify="left")
+        self.export_info.pack(fill="x", padx=18, pady=(18, 6))
+        ctk.CTkButton(card, text="Export Excel workbook", height=46, font=self.f_head,
+                      command=self.export).pack(anchor="w", padx=18, pady=(6, 18))
+        self.result = ctk.CTkFrame(p, corner_radius=14)
+        self.result_lbl = ctk.CTkLabel(self.result, text="", anchor="w", justify="left", wraplength=900)
+        self.result_lbl.pack(fill="x", padx=18, pady=(18, 8))
+        rb = ctk.CTkFrame(self.result, fg_color="transparent")
+        rb.pack(fill="x", padx=18, pady=(0, 18))
+        ctk.CTkButton(rb, text="Open workbook", fg_color=OK, hover_color="#26834c", command=self.open_book).pack(side="left")
+        ctk.CTkButton(rb, text="Open folder", fg_color="transparent", border_width=1, text_color=("gray10", "gray90"),
+                      command=lambda: self.open_path(self.book.parent if self.book else None)).pack(side="left", padx=8)
+
+    def render_export(self):
+        left = sum(i["answer"] is None for i in self.items)
+        self.export_info.configure(
+            text=("All flagged items are checked - ready to export." if not left else
+                  f"{left} item(s) not checked yet. They will be yellow in the workbook (you can still export)."),
+            text_color=(OK if not left else REVIEW))
+
     def export(self):
         try:
             self.items = self.items or load_items()
         except FileNotFoundError:
-            messagebox.showinfo("SmartMark", "Nothing scanned yet - press Scan first.")
+            messagebox.showinfo("SmartMark", "Nothing scanned yet - scan some photos first.")
             return
         left = sum(x["answer"] is None for x in self.items)
         if left and not messagebox.askyesno("SmartMark", f"{left} item(s) not checked yet. They will stay yellow "
@@ -339,21 +599,27 @@ class App:
         apply_answers(self.items)
         ANSWERS.unlink(missing_ok=True)
         self.book = excel.build()
-        self.saved.set(f"Saved: {self.book}")
-        self.open_btn.state(["!disabled"])
-        self.items = load_items()  # what is still flagged after the corrections
+        self.items = load_items()  # whatever is still flagged after the corrections
         self.i = 0
-        self.show()
+        self.refresh_list()
+        self.result_lbl.configure(text=f"Saved:  {self.book}\n"
+                                       f"{'Every value checked.' if not self.items else f'{len(self.items)} cell(s) left yellow to check in Excel.'}")
+        self.result.pack(fill="x", pady=16)
+        self.render_export()
 
     def open_book(self):
-        if self.book and hasattr(os, "startfile"):
-            os.startfile(self.book)  # Windows: opens in Excel
+        self.open_path(self.book)
+
+    @staticmethod
+    def open_path(path):
+        if path and hasattr(os, "startfile"):
+            os.startfile(path)  # Windows: opens Excel / Explorer
 
 
 def main() -> None:
-    root = tk.Tk()
-    App(root)
-    root.mainloop()
+    ctk.set_appearance_mode("System")
+    ctk.set_default_color_theme("green")
+    SmartMarkApp().mainloop()
 
 
 if __name__ == "__main__":

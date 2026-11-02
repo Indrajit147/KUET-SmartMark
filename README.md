@@ -194,19 +194,32 @@ Creates a **new** `output\SmartMark_marks_<date>_<time>.xlsx` every run (an edit
 ## 13 — Teacher app (Milestone 7)
 
 ```bat
+.venv\Scripts\python.exe -m pip install --only-binary=:all: -r requirements.txt
 .venv\Scripts\python.exe scripts\smartmark_app.py
 ```
 
-1. **Photos folder** -> Browse... to the folder of cover photos, then **Scan** (progress bar, ~1 s per photo).
-2. Every doubtful item is shown one at a time: the photo of what was written, what was read, and why it
-   was flagged (a mark, an unsure roll number, an unclear section letter, or a page to glance at).
-   Type the right value and press **Enter** (an empty box = blank cell); Up/Down = previous/next.
-   Answers are saved as you go, so the app can be closed and reopened (**Review last scan**).
-3. **Export Excel** applies the answers and writes a new workbook in `output\` (**Open workbook** opens it).
-   Items not checked stay yellow in the workbook.
+A modern window (light / dark / system theme) with four steps in the sidebar:
 
-Every correction is logged in `reports\teacher_corrections.csv` (with the crop) to retrain the model later.
-Needs Tkinter, which the standard python.org installer includes ("tcl/tk and IDLE" option).
+1. **Scan photos**: choose the folder, press Scan; live progress bar, colour-coded log and counters
+   (covers scanned, read cleanly, items to check, photos to retake).
+2. **Check flagged**: one doubtful item at a time: the photo of what was written, what was read, a
+   "how sure" chip and the reason. **Keep** / **Blank** / type + **Enter**; Up/Down to move; a list of all
+   items with ticks (click to jump); "Show the whole cover" opens the page with what was read.
+3. **All covers**: every cover with an OK / CHECK / RETAKE chip, filter buttons, and View for the whole page.
+4. **Export Excel**: applies the answers, writes a new workbook in `output\`; Open workbook / Open folder.
+
+Answers are saved as you go; every correction is logged in `reports\teacher_corrections.csv` for retraining.
+Needs a Python with Tkinter (the python.org installer's "tcl/tk" option).
+
+## 14 — SmartMark.exe for teachers (Milestone 7)
+
+```bat
+build_exe.bat
+```
+
+Builds `dist\SmartMark\` (about 250 MB): `SmartMark.exe`, the template, the model and
+`How to use SmartMark.txt` (from `docs\TEACHER_GUIDE.md`). Zip that folder and give it to teachers:
+no Python or internet needed. Scans, reports and workbooks are saved inside that folder.
 
 ## Exit criteria for Milestone 1
 
@@ -218,4 +231,4 @@ Needs Tkinter, which the standard python.org installer includes ("tcl/tk and IDL
 
 ## Next milestone
 
-M7 part 2 — package the app as a Windows program (SmartMark.exe) that runs without Python, plus a one-page teacher guide.
+M8 — pilot with teachers on new scripts: time saved, errors left after review, retrain with their corrections.

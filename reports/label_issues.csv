@@ -1,0 +1,9 @@
+﻿scan_id,level,message
+a013,REVIEW,Only 2 attempted questions in Section A
+a015,REVIEW,Q1 total exactly 35: manual check required
+a015,REVIEW,Only 2 attempted questions in Section A
+b011,REVIEW,Q7 total exactly 35: manual check required
+b013,REVIEW,Q7 total exactly 35: manual check required
+b013,REVIEW,Only 2 attempted questions in Section B
+b017,REVIEW,Only 2 attempted questions in Section B
+b021,REVIEW,Q6 total exactly 35: manual check required

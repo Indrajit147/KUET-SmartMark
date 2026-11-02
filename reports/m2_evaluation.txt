@@ -1,0 +1,11 @@
+Scans: 48 | aligned: 48 | flagged for review: 1
+  review b002: roll boxes: only 0/7 written - read the header roll / ask teacher
+Section letter: 48/48 match the labels
+Mark cells blank-vs-written: 1529/1529 = 100.00%
+Roll boxes detected as written: 329/329 (+ 1 sheet(s) noted as empty roll boxes: b002)
+Noted non-number marks (crossed out / dash): 7 cells, 7 detected as ink (expected)
+
+[PASS] all scans aligned
+[PASS] A/B letter matches label on every scan
+[PASS] blank-vs-written >= 99%
+M2 exit gate: PASSED (plus the visual check of data\preview\m2\)

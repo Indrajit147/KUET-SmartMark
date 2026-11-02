@@ -1,0 +1,4 @@
+scan_id,crop,labels,why
+b008,q7_c,x4,scribbled-out digit then a 4 - not a leading zero
+a016,q4_a,05,leading zero touching the 5 (zero not closed)
+b016,q7_a,09,leading zero touching the 9 (zero not closed)

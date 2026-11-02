@@ -1,0 +1,28 @@
+M4 training  - 1489s on 12 CPU threads
+Public test digits (sanity): 99.56%
+A. public data only, on your held-out sheets: digits 97.04% (n=270) | cells 95.14% (n=144) | rolls 100.00% (n=12)
+  confidence >= 0.9: covers 78.5% of digits, 100.00% of those right
+  confidence >= 0.99: covers 0.7% of digits, 100.00% of those right
+B. after fine-tuning, on your held-out sheets: digits 98.15% (n=270) | cells 96.53% (n=144) | rolls 100.00% (n=12)
+  confidence >= 0.9: covers 91.5% of digits, 100.00% of those right
+  confidence >= 0.99: covers 0.0% of digits, 0.00% of those right
+Per class (right / total): 0: 75/76, 1: 47/47, 2: 44/44, 3: 20/20, 4: 11/11, 5: 18/18, 6: 4/4, 7: 16/16, 8: 12/12, 9: 17/18, x: 1/4
+Confusion (rows = true, columns = predicted 0 1 2 3 4 5 6 7 8 9 x):
+  0:  75   0   0   0   1   0   0   0   0   0   0
+  1:   0  47   0   0   0   0   0   0   0   0   0
+  2:   0   0  44   0   0   0   0   0   0   0   0
+  3:   0   0   0  20   0   0   0   0   0   0   0
+  4:   0   0   0   0  11   0   0   0   0   0   0
+  5:   0   0   0   0   0  18   0   0   0   0   0
+  6:   0   0   0   0   0   0   4   0   0   0   0
+  7:   0   0   0   0   0   0   0  16   0   0   0
+  8:   0   0   0   0   0   0   0   0  12   0   0
+  9:   0   0   0   0   0   0   0   1   0  17   0
+  x:   1   0   0   1   0   1   0   0   0   0   1
+Mistakes shown in data\preview\m4_mistakes.jpg: 5
+
+[FAIL] digit accuracy >= 99%: 98.15%
+[FAIL] cell accuracy >= 98%: 96.53%
+[PASS] roll accuracy >= 97%: 100.00%
+Note: your held-out sheets are written by the same 1-2 people as the training sheets; the real test is new writers (after M3 collection).
+ONNX export: models\digit_cnn.onnx (OpenCV check: max difference 2.4e-06)

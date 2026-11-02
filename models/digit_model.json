@@ -1,0 +1,23 @@
+{
+ "classes": [
+  "0",
+  "1",
+  "2",
+  "3",
+  "4",
+  "5",
+  "6",
+  "7",
+  "8",
+  "9",
+  "x"
+ ],
+ "input": "1x1x28x28 float32, white digit on black, brightest stroke = 1.0 (sm_align.to_mnist on the full_strokes mask, then divide by its max)",
+ "x_means": "scribble/dash = empty",
+ "test_scores": {
+  "digit": 0.9814814814814815,
+  "cell": 0.9652777777777778,
+  "roll": 1.0
+ },
+ "quick_run": false
+}

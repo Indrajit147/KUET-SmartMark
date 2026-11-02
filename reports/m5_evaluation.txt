@@ -1,0 +1,17 @@
+Sheets: 48 | ok 38 | review 10 | fail 0 (threshold 0.8)
+== held-out students (never trained on): 12 sheets
+  threshold 0.50: written cells 143 | flagged 10 (7.0%) | accepted 133, of which WRONG 2 (1.50%)
+  threshold 0.70: written cells 143 | flagged 14 (9.8%) | accepted 129, of which WRONG 0 (0.00%)
+  threshold 0.80: written cells 143 | flagged 14 (9.8%) | accepted 129, of which WRONG 0 (0.00%)
+  threshold 0.90: written cells 143 | flagged 23 (16.1%) | accepted 120, of which WRONG 0 (0.00%)
+  threshold 0.95: written cells 143 | flagged 55 (38.5%) | accepted 88, of which WRONG 0 (0.00%)
+  roll numbers: 12/12 exactly right; wrong and NOT flagged: 0
+  section letter right: 12/12
+== all labeled sheets (includes training sheets - optimistic): 48 sheets
+  threshold 0.50: written cells 541 | flagged 10 (1.8%) | accepted 531, of which WRONG 2 (0.38%)
+  threshold 0.70: written cells 541 | flagged 14 (2.6%) | accepted 527, of which WRONG 0 (0.00%)
+  threshold 0.80: written cells 541 | flagged 17 (3.1%) | accepted 524, of which WRONG 0 (0.00%)
+  threshold 0.90: written cells 541 | flagged 31 (5.7%) | accepted 510, of which WRONG 0 (0.00%)
+  threshold 0.95: written cells 541 | flagged 118 (21.8%) | accepted 423, of which WRONG 0 (0.00%)
+  roll numbers: 47/47 exactly right; wrong and NOT flagged: 0
+  section letter right: 48/48

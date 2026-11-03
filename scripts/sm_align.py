@@ -68,6 +68,72 @@ def full_strokes(bgr: np.ndarray, strict: np.ndarray) -> np.ndarray:
     return np.isin(lab, keep[keep > 0]).astype(np.uint8) * 255
 
 
+# Small photos (page 1500-3000 px tall, e.g. a 1080p phone frame). JPEG keeps colour at half resolution, so after
+# shrinking, thin pen strokes keep their darkness but lose most of their per-pixel redness (median 9 -> 4) and
+# red_mask() misses them. Here darkness comes from the sharp brightness channel and "is it red" from a smoothed
+# redness / darkness ratio (grey print ~0.03-0.09, red pen 0.16+). Tuned on the 48 demo covers at 1500/1800/2100 px
+# and on dull, blurred and strongly compressed copies: 0 unflagged wrong values (with LOWRES_THRESHOLD).
+LOWRES_SIGMA = 4.0         # px (300 dpi canvas): smoothing of the colour test
+LOWRES_RATIO = 0.08        # smoothed redness / darkness above this = red ink
+LOWRES_DARK = 18           # darker than the paper by this much (page with contrast >= LOWRES_REF_CONTRAST)
+LOWRES_REF_CONTRAST = 120  # see page_contrast(); duller or blurrier photos get a proportionally lower cut-off
+LOWRES_LINE_RATIO = 0.15   # straight lines at the cell edge below this ratio = printed border, not ink
+LOWRES_EDGE_BAND = 14      # px from the crop edge where printed borders can be
+SUSPECT_MIN_INK = 150      # dark_ink_score at or above this in a cell judged blank -> flag it
+
+
+def page_contrast(warp: np.ndarray, named: dict) -> float:
+    """Paper brightness minus the darkest 1% (printed grid) around the marks table: falls when the photo is
+    dull or out of focus, which weakens pen strokes the same way."""
+    qb = np.array([b for n, b in named.items() if n.startswith("q")])
+    x0, y0 = max(int(qb[:, 0].min()) - 20, 0), max(int(qb[:, 1].min()) - 20, 0)
+    g = cv2.cvtColor(warp[y0:int(qb[:, 3].max()) + 20, x0:int(qb[:, 2].max()) + 20], cv2.COLOR_BGR2GRAY)
+    return float(np.median(g) - np.percentile(g, 1))
+
+
+def lowres_mask(bgr: np.ndarray, dark: float, ratio_min: float = LOWRES_RATIO) -> np.ndarray:
+    """red_mask() for small photos: 255 where the pixel is red pen ink."""
+    img = bgr.astype(np.float32)
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    k = 31 if min(gray.shape[:2]) > 31 else max((min(gray.shape[:2]) // 2) * 2 - 1, 3)
+    paper = cv2.medianBlur(gray, k).astype(np.float32)
+    redness = img[..., 2] - (img[..., 0] + img[..., 1]) / 2
+    paper_red = cv2.medianBlur(np.clip(redness + 128, 0, 255).astype(np.uint8), k).astype(np.float32) - 128
+    d = np.clip(paper - gray, 0, None)
+    ratio = (cv2.GaussianBlur(redness - paper_red, (0, 0), LOWRES_SIGMA)
+             / np.maximum(cv2.GaussianBlur(d, (0, 0), LOWRES_SIGMA), 4))
+    m = ((d > dark) & (ratio > ratio_min)).astype(np.uint8) * 255
+    h, v = line_masks(gray, length=max(15, int(0.4 * min(gray.shape))))
+    lines = cv2.dilate(cv2.bitwise_or(h, v), np.ones((5, 5), np.uint8)) > 0
+    b = LOWRES_EDGE_BAND
+    lines[b:-b, b:-b] = False  # printed borders only: never touch strokes inside the cell
+    m[lines & (ratio < LOWRES_LINE_RATIO)] = 0
+    return cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
+
+
+def dark_ink_score(bgr: np.ndarray, dark: float) -> int:
+    """ink_stats score of anything darker than the paper, whatever its colour (printed cell borders excluded).
+    Safety net for "blank": pen that looks grey/purple in the photo fails the red tests but is still dark.
+    Demo covers: written cells score 195+, empty cells <150 except crossed-out ones and a few specks."""
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    k = 31 if min(gray.shape[:2]) > 31 else max((min(gray.shape[:2]) // 2) * 2 - 1, 3)
+    m = ((cv2.medianBlur(gray, k).astype(np.float32) - gray) > dark).astype(np.uint8) * 255
+    h, v = line_masks(gray, length=max(15, int(0.4 * min(gray.shape))))
+    lines = cv2.dilate(cv2.bitwise_or(h, v), np.ones((5, 5), np.uint8)) > 0
+    b = LOWRES_EDGE_BAND
+    lines[b:-b, b:-b] = False
+    m[lines] = 0
+    return ink_stats(cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8)))[1]
+
+
+def lowres_strokes(bgr: np.ndarray, strict: np.ndarray, dark: float) -> np.ndarray:
+    """full_strokes() for small photos (half the darkness and colour cut-offs, kept only where joined to ink)."""
+    loose = cv2.bitwise_or(lowres_mask(bgr, dark / 2, LOWRES_RATIO / 2), strict)
+    _, lab = cv2.connectedComponents(loose)
+    keep = np.unique(lab[strict > 0])
+    return np.isin(lab, keep[keep > 0]).astype(np.uint8) * 255
+
+
 def to_mnist(m: np.ndarray, blur: bool = True) -> np.ndarray:
     """Crop to the ink, fit in 20x20 keeping aspect, centre by mass in 28x28, light blur like MNIST
     (skip the blur for images that are already anti-aliased, e.g. public datasets)."""
@@ -259,7 +325,11 @@ def align_sheet(img: np.ndarray, t: Template) -> dict:
     named.update(boxes["cells"])
     named["letter"] = t.regions["letter_box"]
     named["header_roll"] = t.regions["header_roll_box"]
+    corners = cv2.perspectiveTransform(np.float32([[[0, 0]], [[0, H]], [[W, 0]], [[W, H]]]), np.linalg.inv(Hm))
+    c = corners.reshape(-1, 2)
+    page_px = float((np.linalg.norm(c[1] - c[0]) + np.linalg.norm(c[3] - c[2])) / 2)  # page height in the photo
     return {"ok": True, "warp": warp, "inliers": inliers, "matches": good, "lines": lines, "lstats": lstats,
+            "page_px": page_px,
             "letter": letter, "letter_scores": letter_scores, "reasons": reasons, "named": named}
 
 

@@ -64,8 +64,8 @@ def layout():
     return col
 
 
-def build() -> "Path":
-    """Write a new workbook from the reports and return its path."""
+def build(out: "Path | None" = None) -> "Path":
+    """Write the workbook from the reports (a new timestamped file unless `out` is given) and return its path."""
     sheets = read_csv("m5_sheets.csv")
     cells = defaultdict(dict)
     for r in read_csv("m5_cells.csv"):
@@ -189,7 +189,7 @@ def build() -> "Path":
         cv.column_dimensions[letter].width = w
 
     OUT_DIR.mkdir(exist_ok=True)
-    out = OUT_DIR / time.strftime("SmartMark_marks_%Y%m%d_%H%M%S.xlsx")
+    out = out or OUT_DIR / time.strftime("SmartMark_marks_%Y%m%d_%H%M%S.xlsx")
     wb.save(out)
 
     # self-check: reopen and count what was written

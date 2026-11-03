@@ -10,3 +10,5 @@ _upload/
 build/
 dist/
 *.spec
+data/captures/
+data/inbox/

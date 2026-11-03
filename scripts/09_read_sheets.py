@@ -3,7 +3,7 @@
 Usage:
     .venv\\Scripts\\python.exe scripts\\09_read_sheets.py                    every photo in data\\raw\\
     .venv\\Scripts\\python.exe scripts\\09_read_sheets.py D:\\scans\\batch1    a folder (or list of photos)
-Options: --threshold 0.8   digits read with lower confidence are flagged for the teacher
+Options: --threshold 0.85  digits read with lower confidence are flagged for the teacher
 
 Every cell gets a value, a confidence and - if anything is doubtful - a flag. Nothing doubtful is guessed:
   - a digit below the confidence threshold                 -> flag
@@ -33,13 +33,25 @@ import numpy as np
 
 from common import (LABELS_CSV, PREVIEW_DIR, REPORT_DIR, ROOT, SECTION_QUESTIONS, SUPPORTED, assign_scan_ids,
                     list_raw_images)
-from sm_align import (FILLED_MIN_INK, align_sheet, full_strokes, ink_stats, join_fragments, load_template,
-                      pieces, red_mask, split_touching, to_mnist)
+from sm_align import (FILLED_MIN_INK, LOWRES_DARK, LOWRES_REF_CONTRAST, SUSPECT_MIN_INK, align_sheet, dark_ink_score,
+                      full_strokes, ink_stats,
+                      join_fragments, load_template, lowres_mask, lowres_strokes, page_contrast, pieces, red_mask,
+                      split_touching, to_mnist)
 
 MODEL = ROOT / "models" / "digit_cnn.onnx"
 CLASSES = json.loads((ROOT / "models" / "digit_model.json").read_text(encoding="utf-8"))["classes"] \
     if (ROOT / "models" / "digit_model.json").exists() else [str(d) for d in range(10)] + ["x"]
 MAX_MARK = 35
+# Page height (pixels) in the photo. Real phone photos: 3700-4300 px. Below FULL_PAGE_PX the small-photo ink test
+# is used and digits need LOWRES_THRESHOLD confidence; below MIN_PAGE_PX the cover is refused. Measured on the 48
+# demo covers shrunk to that size (also dull / blurred / JPEG-70 copies at ~1490 px): unflagged wrong values
+# 0 at 1476-1500, 1800, 2100 px; 1 at 1300 px. About 1 in 3 values is flagged below 3000 px (1 in 30 above).
+# A whole cover in a 1080p frame (phone upright, cover filling the picture) is ~1500 px tall.
+# Digits read with less confidence than this are flagged for the teacher (0.8 = 80%). Used by the app too.
+CONF_THRESHOLD = 0.85
+FULL_PAGE_PX = 3000
+MIN_PAGE_PX = 1475
+LOWRES_THRESHOLD = 0.95
 MARK_CELLS = [f"q{q}_{c}" for q in range(1, 9) for c in "abcd"]
 
 
@@ -53,14 +65,21 @@ def classify(net, m: np.ndarray) -> np.ndarray:
     return e / e.sum()
 
 
-def read_crop(net, colour: np.ndarray, single: bool) -> dict:
-    """One roll box (single digit) or mark cell -> {'value', 'conf', 'note'}; value '' = empty."""
-    strict = red_mask(colour)
+UNREAD_INK = "ink found but nothing readable"
+NOT_RED = "dark writing but no red ink found"
+
+
+def read_crop(net, colour: np.ndarray, single: bool, dark: float = LOWRES_DARK, lowres: bool = False) -> dict:
+    """One roll box (single digit) or mark cell -> {'value', 'conf', 'note'}; value '' = empty.
+    dark: the photo's darkness cut-off (see read_sheet); lowres: use the small-photo ink test."""
+    strict = lowres_mask(colour, dark) if lowres else red_mask(colour)
     if ink_stats(strict)[1] < FILLED_MIN_INK:
+        if dark_ink_score(colour, dark) >= SUSPECT_MIN_INK:  # never call a cell blank while something dark is in it
+            return {"value": "", "conf": 0.0, "note": NOT_RED}
         return {"value": "", "conf": 1.0, "note": ""}
-    ps = join_fragments(pieces(full_strokes(colour, strict)))
+    ps = join_fragments(pieces(lowres_strokes(colour, strict, dark) if lowres else full_strokes(colour, strict)))
     if not ps:
-        return {"value": "", "conf": 0.0, "note": "ink found but nothing readable"}
+        return {"value": "", "conf": 0.0, "note": UNREAD_INK}
     if single:
         ps = [np.bitwise_or.reduce(ps)]
     digits, confs = [], []
@@ -88,7 +107,15 @@ def read_sheet(net, t, img: np.ndarray, threshold: float) -> dict:
     a = align_sheet(img, t)
     if not a["ok"]:
         return {"status": "fail", "reasons": [a["reason"]], "section": "", "roll": "", "cells": {}}
+    if a["page_px"] < MIN_PAGE_PX:
+        return {"status": "fail", "section": "", "roll": "", "cells": {},
+                "reasons": [f"photo resolution too low (page {a['page_px']:.0f} px tall, needs {MIN_PAGE_PX}+): "
+                            "move the camera closer so the cover fills the picture, phone held upright"]}
     warp, named = a["warp"], a["named"]
+    dark = LOWRES_DARK * min(1.0, page_contrast(warp, named) / LOWRES_REF_CONTRAST)  # dull photo -> lower
+    lowres = a["page_px"] < FULL_PAGE_PX
+    if lowres:  # small photo: own ink test, and only very sure digits pass unflagged
+        threshold = max(threshold, LOWRES_THRESHOLD)
     def crop(name):
         x0, y0, x1, y1 = named[name]
         return warp[y0:y1, x0:x1]
@@ -96,11 +123,11 @@ def read_sheet(net, t, img: np.ndarray, threshold: float) -> dict:
     section = a["letter"] or ""
     cells = {}
     for name in MARK_CELLS:
-        r = read_crop(net, crop(name), single=False)
+        r = read_crop(net, crop(name), single=False, dark=dark, lowres=lowres)
         flags = []
         if r["conf"] < threshold:
             flags.append(f"low confidence {r['conf']:.2f}")
-        if r["note"] == "ink found but nothing readable":
+        if r["note"] in (UNREAD_INK, NOT_RED):
             flags.append(r["note"])
         if r["value"] and int(r["value"]) > MAX_MARK:
             flags.append(f"mark above {MAX_MARK}")
@@ -115,7 +142,7 @@ def read_sheet(net, t, img: np.ndarray, threshold: float) -> dict:
                 if cells[f"q{q}_{c}"]["value"]:
                     cells[f"q{q}_{c}"]["flag"] = "; ".join(filter(None, [cells[f"q{q}_{c}"]["flag"],
                                                                          f"Q{q} total {sum(vals)} > {MAX_MARK}"]))
-    roll_reads = [read_crop(net, crop(f"roll_{k + 1}"), single=True) for k in range(7)]
+    roll_reads = [read_crop(net, crop(f"roll_{k + 1}"), single=True, dark=dark, lowres=lowres) for k in range(7)]
     roll = "".join(r["value"] for r in roll_reads)
     roll_conf = min(r["conf"] for r in roll_reads)
     if not roll:
@@ -232,38 +259,35 @@ def collect(inputs: list) -> tuple[list[Path], dict]:
     return files, {p: p.stem for p in files}
 
 
-def run(files: list[Path], ids: dict, threshold: float = 0.8, progress=None) -> list[str]:
-    """Read every photo, write the reports/crops/previews, return the summary lines.
-    progress(i, n, line) is called after each photo (the app uses it for its progress bar)."""
+def load_model():
     if not MODEL.exists():
         raise SystemExit("models\\digit_cnn.onnx missing - run scripts\\08_train_digits.py first")
-    net = cv2.dnn.readNetFromONNX(str(MODEL))
-    t = load_template()
-    (PREVIEW_DIR / "m5").mkdir(parents=True, exist_ok=True)
-    REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    return cv2.dnn.readNetFromONNX(str(MODEL)), load_template()
 
-    results = {}
-    for n, path in enumerate(files, start=1):
-        t0 = time.time()
-        img = cv2.imread(str(path))
-        sid = ids[path]
-        res = read_sheet(net, t, img, threshold) if img is not None else \
-            {"status": "fail", "reasons": ["cannot open image"], "section": "", "roll": "", "cells": {}}
-        res["file"] = str(path)
-        results[sid] = res
-        if res["status"] != "fail":
-            preview(sid, res, PREVIEW_DIR / "m5" / f"{sid}.jpg")
-            save_crops(sid, res)
-        line = (f"{sid}: {res['status']:6s} section {res['section'] or '?'} roll {res['roll'] or '?':7s} "
-                f"flagged cells {len(res.get('flagged', []))}  {'; '.join(res['reasons'])}  ({time.time() - t0:.1f}s)")
-        (progress or (lambda i, k, txt: print(txt, flush=True)))(n, len(files), line)
 
+def read_one(net, t, path: Path, sid: str, threshold: float = CONF_THRESHOLD) -> dict:
+    """Read one photo (and save its preview + crops for the review screen)."""
+    img = cv2.imread(str(path))
+    res = read_sheet(net, t, img, threshold) if img is not None else \
+        {"status": "fail", "reasons": ["cannot open image"], "section": "", "roll": "", "cells": {}}
+    res["file"] = str(path)
+    if res["status"] != "fail":
+        preview(sid, res, PREVIEW_DIR / "m5" / f"{sid}.jpg")
+        save_crops(sid, res)
+    return res
+
+
+def write_reports(results: dict, threshold: float = CONF_THRESHOLD) -> list[str]:
+    """Batch checks + reports for everything read so far. Safe to call again after each new photo."""
+    dup_note = "sheet in this batch"
     dup = Counter((r["roll"], r["section"]) for r in results.values() if r["roll"] and r["section"])
-    for sid, r in results.items():
+    for r in results.values():
+        r["reasons"] = [x for x in r["reasons"] if not x.endswith(dup_note)]  # recomputed every call
         if r["roll"] and dup[(r["roll"], r["section"])] > 1:
-            r["reasons"].append(f"roll {r['roll']} has more than one Section {r['section']} sheet in this batch")
-            r["status"] = "review"
-
+            r["reasons"].append(f"roll {r['roll']} has more than one Section {r['section']} {dup_note}")
+        if r["status"] != "fail":
+            r["status"] = "review" if r["reasons"] or r.get("flagged") else "ok"
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
     with (REPORT_DIR / "m5_sheets.csv").open("w", encoding="utf-8-sig", newline="") as f:
         w = csv.writer(f)
         w.writerow(["scan_id", "file", "status", "section", "roll_no", "flagged_cells", "reasons", *MARK_CELLS])
@@ -276,7 +300,6 @@ def run(files: list[Path], ids: dict, threshold: float = 0.8, progress=None) -> 
         for sid, r in results.items():
             for c, v in r["cells"].items():
                 w.writerow([sid, c, v["value"], f"{v['conf']:.3f}", v["flag"], v["note"]])
-
     st = Counter(r["status"] for r in results.values())
     summary = [f"Sheets: {len(results)} | ok {st['ok']} | review {st['review']} | fail {st['fail']} "
                f"(threshold {threshold})"]
@@ -285,10 +308,26 @@ def run(files: list[Path], ids: dict, threshold: float = 0.8, progress=None) -> 
     return summary
 
 
+def run(files: list[Path], ids: dict, threshold: float = CONF_THRESHOLD, progress=None) -> list[str]:
+    """Read every photo, write the reports/crops/previews, return the summary lines.
+    progress(i, n, line) is called after each photo (the app uses it for its progress bar)."""
+    net, t = load_model()
+    (PREVIEW_DIR / "m5").mkdir(parents=True, exist_ok=True)
+    results = {}
+    for n, path in enumerate(files, start=1):
+        t0 = time.time()
+        sid = ids[path]
+        res = results[sid] = read_one(net, t, path, sid, threshold)
+        line = (f"{sid}: {res['status']:6s} section {res['section'] or '?'} roll {res['roll'] or '?':7s} "
+                f"flagged cells {len(res.get('flagged', []))}  {'; '.join(res['reasons'])}  ({time.time() - t0:.1f}s)")
+        (progress or (lambda i, k, txt: print(txt, flush=True)))(n, len(files), line)
+    return write_reports(results, threshold)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("inputs", nargs="*", help="photos or folders (default: data\\raw)")
-    ap.add_argument("--threshold", type=float, default=0.8)  # held-out: 0 silent errors from 0.7 up; 0.8 keeps flags <= 10%
+    ap.add_argument("--threshold", type=float, default=CONF_THRESHOLD)  # held-out: 0 silent errors from 0.7 up
     args = ap.parse_args()
     files, ids = collect(args.inputs)
     summary = run(files, ids, args.threshold)

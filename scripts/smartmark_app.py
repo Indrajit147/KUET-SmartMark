@@ -21,13 +21,17 @@ import threading
 import time
 from importlib import import_module
 from pathlib import Path
+import tkinter as tk
 from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
+import cv2
+import numpy as np
 
-from PIL import Image
+from PIL import Image, ImageTk
 
 from common import PREVIEW_DIR, REPORT_DIR, ROOT
+from sm_camera import AutoShutter, Camera, FolderWatch, PhoneUpload, find_cover, read_image
 
 reader = import_module("09_read_sheets")
 excel = import_module("10_fill_excel")
@@ -36,6 +40,8 @@ PROCESSED = ROOT / "data" / "processed"
 ANSWERS = REPORT_DIR / "review_answers.json"
 CORRECTIONS = REPORT_DIR / "teacher_corrections.csv"
 MAX_MARK = 35
+WATCH = "Phone photos (watch a folder)"   # phone's own camera, synced to a laptop folder
+PHONE = "Phone browser (no app needed)"   # phone opens a SmartMark page and sends each full-resolution photo
 
 
 # ------------------------------------------------------------------ review logic (no GUI - tested on its own)
@@ -196,32 +202,36 @@ class SmartMarkApp(ctk.CTk):
 
         side = ctk.CTkFrame(self, width=230, corner_radius=0)
         side.grid(row=0, column=0, sticky="nsw")
-        side.grid_rowconfigure(6, weight=1)
+        side.grid_rowconfigure(7, weight=1)
         ctk.CTkLabel(side, text="SmartMark", font=ctk.CTkFont(size=26, weight="bold")).grid(row=0, column=0, padx=24, pady=(28, 0), sticky="w")
         ctk.CTkLabel(side, text="Marks from cover photos\nstraight into Excel", justify="left",
                      text_color=("gray35", "gray70")).grid(row=1, column=0, padx=24, pady=(2, 24), sticky="w")
         self.nav = {}
-        for r, (key, label) in enumerate([("scan", "1   Scan photos"), ("review", "2   Check flagged"),
-                                          ("covers", "3   All covers"), ("export", "4   Export Excel")], start=2):
+        for r, (key, label) in enumerate([("scan", "1   Scan a folder"), ("camera", "2   Live camera"),
+                                          ("review", "3   Check flagged"), ("covers", "4   All covers"),
+                                          ("export", "5   Export Excel")], start=2):
             b = ctk.CTkButton(side, text=label, anchor="w", height=40, corner_radius=8, fg_color="transparent",
                               text_color=("gray10", "gray90"), hover_color=("gray80", "gray28"),
                               font=ctk.CTkFont(size=14), command=lambda k=key: self.show(k))
             b.grid(row=r, column=0, padx=14, pady=3, sticky="ew")
             self.nav[key] = b
-        ctk.CTkLabel(side, text="Appearance").grid(row=7, column=0, padx=24, sticky="w")
+        ctk.CTkLabel(side, text="Appearance").grid(row=8, column=0, padx=24, sticky="w")
         ctk.CTkOptionMenu(side, values=["System", "Light", "Dark"], width=180,
-                          command=lambda m: ctk.set_appearance_mode(m)).grid(row=8, column=0, padx=24, pady=(4, 24))
+                          command=lambda m: ctk.set_appearance_mode(m)).grid(row=9, column=0, padx=24, pady=(4, 24))
 
         self.pages = {k: ctk.CTkFrame(self, fg_color="transparent") for k in self.nav}
         for p in self.pages.values():
             p.grid(row=0, column=1, sticky="nsew", padx=28, pady=24)
         self._build_scan()
+        self._build_camera()
         self._build_review()
         self._build_covers()
         self._build_export()
         self.bind("<Return>", lambda e: self.save() if self.current == "review" else None)
         self.bind("<Up>", lambda e: self.move(-1) if self.current == "review" else None)
         self.bind("<Down>", lambda e: self.move(1) if self.current == "review" else None)
+        self.bind("<space>", lambda e: self.cam_capture() if self.current == "camera" else None)
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.current = ""
         self.show("scan")
         self.after(200, self.load_last)
@@ -351,7 +361,341 @@ class SmartMarkApp(ctk.CTk):
         self.i = next((k for k, it in enumerate(self.items) if it["answer"] is None), 0)
         self.refresh_list()
 
-    # ---------------------------------------------------------------- 2. review
+    # ---------------------------------------------------------------- 2. live camera
+    def _build_camera(self):
+        p = self.pages["camera"]
+        p.grid_columnconfigure(0, weight=3)
+        p.grid_columnconfigure(1, weight=2)
+        p.grid_rowconfigure(2, weight=1)
+        self.cam = None
+        self.cam_model = None              # (net, template) - loaded on first use
+        self.cam_lock = threading.Lock()   # one heavy OpenCV job at a time (detector or reader)
+        self.cam_outline = None
+        self.cam_busy = False
+        self.cam_results: dict = {}
+        self.cam_order: list[str] = []
+        self.cam_session = ""
+        self.cam_q: queue.Queue = queue.Queue()
+        self.shutter = AutoShutter()
+        ctk.CTkLabel(p, text="Live camera", font=self.f_title).grid(row=0, column=0, columnspan=2, sticky="w")
+        ctk.CTkLabel(p, text="Easiest: \"Phone browser\" - open the address SmartMark shows in the phone's browser and tap "
+                             "Take photo; the phone's own camera takes a full-quality photo and SmartMark reads it at once "
+                             "(the result shows on the phone). Or watch a folder the phone photos sync to, or use a live "
+                             "camera. The live workbook is updated after every cover.",
+                     text_color=("gray35", "gray70"), wraplength=980, justify="left").grid(
+            row=1, column=0, columnspan=2, sticky="w", pady=(2, 14))
+        view = ctk.CTkFrame(p, corner_radius=14)
+        view.grid(row=2, column=0, sticky="nsew", padx=(0, 16))
+        # plain Tk label: one picture painted over for every frame (CTkLabel + new CTkImage per frame breaks on Windows)
+        self.cam_view = tk.Label(view, text="Not started.\nChoose the photo folder or camera on the right and press Start.",
+                                 bg="#1b1f24", fg="#e6e6e6", font=("Segoe UI", 14, "bold"), bd=0, wraplength=560)
+        self.cam_view.pack(expand=True, fill="both", padx=12, pady=(12, 0))
+        self.cam_photo = None
+        self.cam_hint = ctk.CTkLabel(view, text="", font=self.f_head)
+        self.cam_hint.pack(pady=10)
+
+        side = ctk.CTkFrame(p, fg_color="transparent")
+        side.grid(row=2, column=1, sticky="nsew")
+        side.grid_columnconfigure(0, weight=1)
+        side.grid_rowconfigure(2, weight=1)
+        ctl = ctk.CTkFrame(side, corner_radius=14)
+        ctl.grid(row=0, column=0, sticky="ew")
+        ctk.CTkLabel(ctl, text="Camera", font=self.f_head).pack(anchor="w", padx=16, pady=(14, 2))
+        self.cam_src = ctk.CTkOptionMenu(ctl, values=[PHONE, WATCH, "Phone camera (IP Webcam app)", "Webcam 0", "Webcam 1",
+                                                      "Webcam 2"], command=self.cam_source_changed)
+        self.cam_src.pack(fill="x", padx=16)
+        self.cam_url = ctk.CTkEntry(ctl)
+        self.cam_url.pack(fill="x", padx=16, pady=6)
+        self.cam_source_changed(PHONE)
+        row = ctk.CTkFrame(ctl, fg_color="transparent")
+        row.pack(fill="x", padx=16)
+        self.cam_btn = ctk.CTkButton(row, text="Start", command=self.cam_toggle)
+        self.cam_btn.pack(side="left", expand=True, fill="x")
+        ctk.CTkButton(row, text="New batch", width=100, fg_color="transparent", border_width=1,
+                      text_color=("gray10", "gray90"), command=self.cam_new_batch).pack(side="left", padx=(6, 0))
+        self.cam_auto = ctk.CTkSwitch(ctl, text="Auto-capture when the cover is still")
+        self.cam_auto.select()
+        self.cam_auto.pack(anchor="w", padx=16, pady=8)
+        self.cam_snap = ctk.CTkButton(ctl, text="Take picture now  (Space)", height=42, font=self.f_head,
+                                      command=self.cam_capture, state="disabled")
+        self.cam_snap.pack(fill="x", padx=16, pady=(0, 16))
+
+        last = ctk.CTkFrame(side, corner_radius=14)
+        last.grid(row=1, column=0, sticky="ew", pady=12)
+        top = ctk.CTkFrame(last, fg_color="transparent")
+        top.pack(fill="x", padx=16, pady=(14, 4))
+        self.cam_chip = ctk.CTkLabel(top, text="", width=80, corner_radius=8, text_color="white")
+        self.cam_chip.pack(side="left")
+        self.cam_count = ctk.CTkLabel(top, text="0 covers in this batch", text_color=("gray35", "gray70"))
+        self.cam_count.pack(side="right")
+        self.cam_last = ctk.CTkLabel(last, text="No cover taken yet.", anchor="w", justify="left", wraplength=300)
+        self.cam_last.pack(fill="x", padx=16, pady=(0, 14))
+        self.cam_list = ctk.CTkScrollableFrame(side, corner_radius=14, label_text="This batch")
+        self.cam_list.grid(row=2, column=0, sticky="nsew")
+        btns = ctk.CTkFrame(side, fg_color="transparent")
+        btns.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        btns.grid_columnconfigure((0, 1, 2), weight=1, uniform="cam")
+        ctk.CTkButton(btns, text="Undo last", fg_color=("gray60", "gray35"), command=self.cam_undo).grid(row=0, column=0, sticky="ew")
+        ctk.CTkButton(btns, text="Check flagged", command=lambda: self.show("review")).grid(row=0, column=1, sticky="ew", padx=6)
+        ctk.CTkButton(btns, text="Open workbook", fg_color=OK, hover_color="#26834c",
+                      command=lambda: self.open_path(self.live_book())).grid(row=0, column=2, sticky="ew")
+
+    def cam_source_changed(self, v):
+        self.cam_url.configure(state="normal")
+        self.cam_url.delete(0, "end")
+        self.cam_url.configure(state="normal" if v == WATCH or v.startswith("Phone camera") else "disabled",
+                               placeholder_text="Folder the phone photos sync to" if v == WATCH
+                               else "The phone page address appears after Start" if v == PHONE
+                               else "Phone address, e.g. http://192.168.0.105:8080")
+        if v == WATCH:
+            folder = filedialog.askdirectory(title="Folder the phone photos sync to")
+            if folder:
+                self.cam_url.insert(0, folder)
+
+    def live_book(self) -> Path:
+        return excel.OUT_DIR / f"SmartMark_live_{self.cam_session}.xlsx"
+
+    def cam_new_batch(self):
+        if self.cam_busy:
+            self.cam_last.configure(text="Still reading the last picture - try again in a moment.")
+            return
+        self.cam_results, self.cam_order = {}, []
+        self.cam_session = time.strftime("%Y%m%d_%H%M%S")
+        ANSWERS.unlink(missing_ok=True)
+        self.cam_render_list()
+        self.cam_chip.configure(text="", fg_color="transparent")
+        self.cam_last.configure(text="New batch started - no cover taken yet.")
+
+    def cam_toggle(self):
+        if self.cam:
+            self.cam.close()
+            self.cam = None
+            self.cam_btn.configure(text="Start")
+            self.cam_snap.configure(state="disabled")
+            self.cam_view.configure(image="", text="Stopped.")
+            self.cam_photo = None
+            self.cam_hint.configure(text="")
+            return
+        src = self.cam_src.get()
+        if src in (WATCH, PHONE):
+            if not self.cam_session:
+                self.cam_new_batch()
+            try:
+                self.cam = (PhoneUpload(ROOT / "data" / "inbox" / self.cam_session) if src == PHONE
+                            else FolderWatch(self.cam_url.get().strip() or filedialog.askdirectory()))
+            except (RuntimeError, OSError) as exc:
+                messagebox.showerror("SmartMark", str(exc) if src == PHONE
+                                     else f"{exc}\nChoose the folder your phone photos sync to.")
+                return
+            self.cam_btn.configure(text="Stop")
+            if src == PHONE:
+                self.cam_url.configure(state="normal")
+                self.cam_url.delete(0, "end")
+                self.cam_url.insert(0, self.cam.url)
+                self.cam_url.configure(state="readonly")
+            self.cam_view.configure(image="", text=(
+                f"On the phone, open this address in the browser:\n\n{self.cam.url}\n\nthen tap Take photo for each cover.\n\n"
+                "Phone and laptop must be on the same Wi-Fi (or the laptop on the phone's hotspot).\n"
+                "If the page does not open: allow Python in the Windows Firewall message."
+                if src == PHONE else "Waiting for a new photo..."))
+            self.cam_photo = None
+            threading.Thread(target=self._watch, args=(self.cam,), daemon=True).start()
+            self.after(60, self._cam_tick)
+            return
+        source = self.cam_url.get().strip() if src.startswith("Phone") else int(src.split()[-1])
+        if source == "":
+            messagebox.showinfo("SmartMark", "Type the phone address shown in the IP Webcam app "
+                                             "(for example http://192.168.0.105:8080).")
+            return
+        if source != "" and isinstance(source, str) and not source.startswith("http"):
+            source = "http://" + source
+        try:
+            self.cam = Camera(source)
+        except RuntimeError as exc:
+            messagebox.showerror("SmartMark", str(exc))
+            return
+        if not self.cam_session:
+            self.cam_new_batch()
+        self.cam_btn.configure(text="Stop camera")
+        self.cam_snap.configure(state="normal")
+        self.shutter = AutoShutter()
+        threading.Thread(target=self._cam_detect, args=(self.cam,), daemon=True).start()
+        self.after(60, self._cam_tick)
+
+    def _model(self):
+        if self.cam_model is None:
+            self.cam_model = reader.load_model()
+        return self.cam_model
+
+    def _watch(self, cam):
+        """Background: read each new photo that appears in the folder, one at a time."""
+        while cam.running and cam is self.cam:
+            p = None if self.cam_busy else cam.new_photo()
+            if p is None:
+                time.sleep(1.0)
+                continue
+            self.cam_busy = True
+            self._cam_read(cam, p)
+
+    def _cam_detect(self, cam):
+        """Background: look for the cover twice a second; ask for a picture when it is held still."""
+        while cam.running and cam is self.cam:
+            f = cam.frame()
+            if f is None or self.cam_busy or not self.cam_lock.acquire(blocking=False):
+                time.sleep(0.2)
+                continue
+            try:
+                k = min(1.0, 960 / max(f.shape[:2]))
+                small = cv2.resize(f, None, fx=k, fy=k, interpolation=cv2.INTER_AREA) if k < 1 else f
+                out = find_cover(small, self._model()[1])
+            finally:
+                self.cam_lock.release()
+            self.cam_outline = None if out is None else (out / k, f.shape[:2])
+            if self.shutter.update(out, float(np.hypot(*small.shape[:2]))) and self.cam_auto.get():
+                self.cam_q.put(("auto",))
+            time.sleep(0.4)
+
+    def _cam_tick(self):
+        """Foreground: show the newest frame with the cover outline, and handle finished pictures."""
+        cam = self.cam
+        while not self.cam_q.empty():
+            msg = self.cam_q.get()
+            if msg[0] == "auto":
+                self.cam_capture()
+            elif msg[0] == "done":
+                self.cam_finished(*msg[1:])
+            elif msg[0] == "error":
+                self.cam_busy = False
+                self.cam_snap.configure(state="normal" if isinstance(self.cam, Camera) else "disabled", text="Take picture now  (Space)")
+                self.cam_chip.configure(text="ERROR", fg_color=FAIL)
+                self.cam_last.configure(text=msg[1])
+                if isinstance(self.cam, PhoneUpload):
+                    self.cam.status = f"ERROR - {msg[1]}"
+        if cam is None:
+            return
+        if cam.error:
+            messagebox.showerror("SmartMark", cam.error)
+            self.cam_toggle()
+            return
+        f = cam.frame()
+        if f is not None and self.current == "camera":
+            ol = self.cam_outline
+            if ol is not None and ol[1] == f.shape[:2]:
+                cv2.polylines(f, [ol[0].astype(np.int32)], True, (90, 200, 60), max(3, f.shape[0] // 180))
+            watching = isinstance(cam, FolderWatch)
+            self.cam_hint.configure(
+                text=("Reading the cover..." if self.cam_busy else
+                      cam.note or (f"Last photo shown - phone page: {cam.url}" if isinstance(cam, PhoneUpload) else
+                                   f"Last photo shown - waiting for the next one in {cam.folder.name}") if watching else
+                      "Cover found - hold it still" if ol is not None else "Hold a cover under the camera"),
+                text_color=(REVIEW if self.cam_busy or watching and cam.note else OK if ol is not None
+                            else ("gray35", "gray70")))
+            k = min(760 / f.shape[1], 560 / f.shape[0])
+            im = Image.fromarray(cv2.cvtColor(cv2.resize(f, (int(f.shape[1] * k), int(f.shape[0] * k)),
+                                                          interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2RGB))
+            if self.cam_photo is None or (self.cam_photo.width(), self.cam_photo.height()) != im.size:
+                self.cam_photo = ImageTk.PhotoImage(im)
+                self.cam_view.configure(image=self.cam_photo, text="")
+            else:
+                self.cam_photo.paste(im)  # same picture object, new pixels
+        self.after(60, self._cam_tick)
+
+    def cam_capture(self):
+        if not isinstance(self.cam, Camera) or self.cam_busy:
+            return
+        self.cam_busy = True
+        self.cam_snap.configure(state="disabled", text="Reading...")
+        threading.Thread(target=self._cam_read, args=(self.cam,), daemon=True).start()
+
+    def _cam_read(self, cam, src: Path | None = None):
+        """Background: take the picture (or load the new photo src), save it, read it, update reports and the
+        live workbook."""
+        try:
+            img = cam.still() if src is None else read_image(src)
+            if src is not None:
+                cam.show(img)
+            folder = ROOT / "data" / "captures" / self.cam_session
+            folder.mkdir(parents=True, exist_ok=True)
+            sid = f"c{len(self.cam_order) + 1:03d}"
+            while sid in self.cam_results:  # after an undo, never reuse a number
+                sid = f"c{int(sid[1:]) + 1:03d}"
+            path = folder / f"{sid}.jpg"
+            cv2.imwrite(str(path), img, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            with self.cam_lock:
+                net, t = self._model()
+                res = reader.read_one(net, t, path, sid)
+            self.cam_results[sid] = res
+            self.cam_order.append(sid)
+            reader.write_reports(self.cam_results)
+            note = "" if src is None else f"Photo: {src.name}"
+            try:
+                excel.build(self.live_book())
+            except PermissionError:
+                note += "\nClose the live workbook in Excel so it can be updated."
+            self.cam_q.put(("done", sid, note))
+        except Exception as exc:  # shown in the window instead of a silent crash
+            self.cam_q.put(("error", f"Picture not taken: {exc}" if src is None else f"{src.name} not read: {exc}"))
+
+    def cam_finished(self, sid, note):
+        self.cam_busy = False
+        self.cam_snap.configure(state="normal" if isinstance(self.cam, Camera) else "disabled", text="Take picture now  (Space)")
+        r = self.cam_results[sid]
+        self.cam_chip.configure(text={"ok": "OK", "review": "CHECK", "fail": "RETAKE"}[r["status"]],
+                                fg_color=CHIP[r["status"]])
+        flagged = len(r.get("flagged", []))
+        text = (f"{sid}:  Section {r['section'] or '?'}   Roll {r['roll'] or '?'}"
+                + (f"   -  {flagged} mark(s) to check" if flagged else "")
+                + (f"\n{'; '.join(r['reasons'])}" if r["reasons"] else "")
+                + ("\nRetake this cover." if r["status"] == "fail" else "")
+                + ("\nThe phone sent a small photo. In IP Webcam: Video preferences > Photo resolution > choose the "
+                   "largest, then restart the server." if self.cam and self.cam.phone
+                   and any("resolution too low" in x for x in r["reasons"]) else "")
+                + (f"\n{note}" if note else ""))
+        self.cam_last.configure(text=text)
+        if isinstance(self.cam, PhoneUpload):  # the teacher sees the result on the phone
+            self.cam.status = f"{self.cam_chip.cget('text')}  -  {text}\n\nNext cover: tap Take photo."
+        self.cam_render_list()
+        self.items = load_items()
+        self.refresh_list()
+
+    def cam_undo(self):
+        if self.cam_busy:
+            self.cam_last.configure(text="Still reading the last picture - press Undo again in a moment.")
+            return
+        if not self.cam_order:
+            return
+        sid = self.cam_order.pop()
+        self.cam_results.pop(sid, None)
+        reader.write_reports(self.cam_results)
+        try:
+            excel.build(self.live_book())
+        except PermissionError:
+            pass
+        self.cam_last.configure(text=f"{sid} removed from the batch.")
+        self.cam_chip.configure(text="", fg_color="transparent")
+        self.cam_render_list()
+        self.items = load_items()
+        self.refresh_list()
+
+    def cam_render_list(self):
+        for w in self.cam_list.winfo_children():
+            w.destroy()
+        for sid in reversed(self.cam_order):
+            r = self.cam_results[sid]
+            row = ctk.CTkFrame(self.cam_list, fg_color="transparent")
+            row.pack(fill="x", pady=1)
+            ctk.CTkLabel(row, text={"ok": "OK", "review": "CHECK", "fail": "RETAKE"}[r["status"]], width=64,
+                         corner_radius=6, fg_color=CHIP[r["status"]], text_color="white").pack(side="left", padx=(0, 8))
+            ctk.CTkLabel(row, text=f"{sid}   {r['section'] or '?'}   {r['roll'] or 'roll ?'}", anchor="w").pack(side="left")
+        n = len(self.cam_order)
+        self.cam_count.configure(text=f"{n} cover{'s' if n != 1 else ''} in this batch")
+
+    def on_close(self):
+        if self.cam:
+            self.cam.close()
+        self.destroy()
+
+    # ---------------------------------------------------------------- 3. review
     def _build_review(self):
         p = self.pages["review"]
         p.grid_columnconfigure(0, weight=3)
@@ -612,7 +956,7 @@ class SmartMarkApp(ctk.CTk):
 
     @staticmethod
     def open_path(path):
-        if path and hasattr(os, "startfile"):
+        if path and Path(path).exists() and hasattr(os, "startfile"):
             os.startfile(path)  # Windows: opens Excel / Explorer
 
 

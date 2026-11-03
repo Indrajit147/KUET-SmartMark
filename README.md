@@ -209,6 +209,31 @@ A modern window (light / dark / system theme) with four steps in the sidebar:
 4. **Export Excel**: applies the answers, writes a new workbook in `output\`; Open workbook / Open folder.
 
 Answers are saved as you go; every correction is logged in `reports\teacher_corrections.csv` for retraining.
+
+**Live camera** (sidebar step 2): hold each cover under a camera; when the cover is found (green outline)
+and held still, SmartMark takes the picture, reads it, shows OK / CHECK / RETAKE at once and updates
+`output\SmartMark_live_<batch>.xlsx`. Space = take the picture manually; Undo last; New batch.
+Photos are kept in `data\captures\<batch>\`.
+- **Phone photos (watch a folder)** - the default and the best quality: photos taken with the phone's own
+  camera app sync to a laptop folder (OneDrive camera upload, Syncthing). SmartMark polls the folder every
+  second and reads each *new* JPG/PNG once its size stops changing (so half-synced files are skipped);
+  photos already in the folder when watching starts are ignored; HEIC photos get a "save JPEG" hint.
+- **Use a phone camera**: Android app *IP Webcam* -> Start server -> type its address (e.g.
+  `http://192.168.0.105:8080`). Live preview comes from `/video`; the picture that is read is the phone's
+  full-resolution photo (`/photoaf.jpg`, focus first).
+- **Resolution rule**: the cover's page must be at least 1475 px tall in the picture (a whole cover filling a
+  1080p frame, phone held upright, is ~1500 px). Below 3000 px a small-photo ink test is used (darkness from the
+  sharp brightness channel, "is it red" from a smoothed colour ratio, cut-off scaled by the photo's contrast) and
+  digits need 0.95 confidence instead of 0.8. Tested on the 48 demo covers shrunk to 1476-1500 / 1800 / 2100 px,
+  plus dull, blurred and JPEG-70 copies: 0 wrong values unflagged; at 1300 px: 1, hence the floor.
+  Safety net at every size: a cell is never called blank while it holds dark writing of any colour
+  (sm_align.dark_ink_score >= 150) - it is flagged "dark writing but no red ink found" instead.
+  Real IP Webcam 1080p photos (6 captures of one test cover, 72 values): 0 unflagged wrong, but 47 of 72
+  flagged (the pen looks greyish there). Demo covers at 1080p size: ~1 in 3 flagged; full-resolution phone
+  photos: ~1 in 30. So for real work use the phone's own camera + "watch a folder".
+- **Photo quality also matters at full resolution**: on dull (contrast -40%) or clearly out-of-focus copies of
+  the demo photos the full-resolution path made 1-3 confident digit mistakes (0 on the normal photos). Take
+  photos in good light and let the phone focus.
 Needs a Python with Tkinter (the python.org installer's "tcl/tk" option).
 
 ## 14 — SmartMark.exe for teachers (Milestone 7)
